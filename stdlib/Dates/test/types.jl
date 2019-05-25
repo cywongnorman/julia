@@ -194,6 +194,10 @@ c = Dates.Time(0)
     @test isfinite(Dates.Date)
     @test isfinite(Dates.DateTime)
     @test isfinite(Dates.Time)
+    @test c == c
+    @test c == (c + Dates.Hour(24))
+    @test hash(c) == hash(c + Dates.Hour(24))
+    @test hash(c + Dates.Nanosecond(10)) == hash(c + Dates.Hour(24) + Dates.Nanosecond(10))
 end
 @testset "Date-DateTime conversion/promotion" begin
     global a, b, c, d
@@ -222,6 +226,24 @@ end
     @test a < b
     @test a != b
     @test Dates.Date(Dates.DateTime(Dates.Date(2012, 7, 1))) == Dates.Date(2012, 7, 1)
+end
+
+@testset "issue #31524" begin
+    dt1 = Libc.strptime("%Y-%M-%dT%H:%M:%SZ", "2018-11-16T10:26:14Z")
+    dt2 = Base.Libc.TmStruct(14, 30, 5, 10, 1, 99, 3, 40, 0)
+
+    time = Time(dt1)
+    @test typeof(time) == Time
+    @test time == Dates.Time(10, 26, 14)
+
+    date = Date(dt2)
+    @test typeof(date) == Date
+    @test date == Dates.Date(1999, 2, 10)
+
+    datetime = DateTime(dt2)
+    @test typeof(datetime) == DateTime
+    @test datetime == Dates.DateTime(1999, 2, 10, 5, 30, 14)
+
 end
 
 end

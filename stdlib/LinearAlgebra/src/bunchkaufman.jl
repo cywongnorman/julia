@@ -13,7 +13,7 @@ struct BunchKaufman{T,S<:AbstractMatrix} <: Factorization{T}
     info::BlasInt
 
     function BunchKaufman{T,S}(LD, ipiv, uplo, symmetric, rook, info) where {T,S<:AbstractMatrix}
-        @assert !has_offset_axes(LD)
+        require_one_based_indexing(LD)
         new(LD, ipiv, uplo, symmetric, rook, info)
     end
 end
@@ -125,8 +125,8 @@ size(B::BunchKaufman, d::Integer) = size(getfield(B, :LD), d)
 issymmetric(B::BunchKaufman) = B.symmetric
 ishermitian(B::BunchKaufman) = !B.symmetric
 
-function _ipiv2perm_bk(v::AbstractVector{T}, maxi::Integer, uplo::AbstractChar) where T
-    @assert !has_offset_axes(v)
+function _ipiv2perm_bk(v::AbstractVector{T}, maxi::Integer, uplo::AbstractChar, rook::Bool) where T
+    require_one_based_indexing(v)
     p = T[1:maxi;]
     uploL = uplo == 'L'
     i = uploL ? 1 : maxi
@@ -137,11 +137,16 @@ function _ipiv2perm_bk(v::AbstractVector{T}, maxi::Integer, uplo::AbstractChar) 
             p[i], p[vi] = p[vi], p[i]
             i += uploL ? 1 : -1
         else # the 2x2 blocks
+            if rook
+                p[i], p[-vi] = p[-vi], p[i]
+            end
             if uploL
-                p[i + 1], p[-vi] = p[-vi], p[i + 1]
+                vp = rook ? -v[i+1] : -vi
+                p[i + 1], p[vp] = p[vp], p[i + 1]
                 i += 2
             else # 'U'
-                p[i - 1], p[-vi] = p[-vi], p[i - 1]
+                vp = rook ? -v[i-1] : -vi
+                p[i - 1], p[vp] = p[vp], p[i - 1]
                 i -= 2
             end
         end
@@ -154,8 +159,8 @@ end
 
 Extract the factors of the Bunch-Kaufman factorization `B`. The factorization can take the
 two forms `P'*L*D*L'*P` or `P'*U*D*U'*P` (or `L*D*transpose(L)` in the complex symmetric case)
-where `P` is a (symmetric) permutation matrix, `L` is a `UnitLowerTriangular` matrix, `U` is a
-`UnitUpperTriangular`, and `D` is a block diagonal symmetric or Hermitian matrix with
+where `P` is a (symmetric) permutation matrix, `L` is a [`UnitLowerTriangular`](@ref) matrix, `U` is a
+[`UnitUpperTriangular`](@ref), and `D` is a block diagonal symmetric or Hermitian matrix with
 1x1 or 2x2 blocks. The argument `d` can be
 
 - `:D`: the block diagonal matrix
@@ -208,7 +213,7 @@ julia> F.U*F.D*F.U' - F.P*A*F.P'
 function getproperty(B::BunchKaufman{T}, d::Symbol) where {T<:BlasFloat}
     n = size(B, 1)
     if d == :p
-        return _ipiv2perm_bk(getfield(B, :ipiv), n, getfield(B, :uplo))
+        return _ipiv2perm_bk(getfield(B, :ipiv), n, getfield(B, :uplo), B.rook)
     elseif d == :P
         return Matrix{T}(I, n, n)[:,invperm(B.p)]
     elseif d == :L || d == :U || d == :D
@@ -250,7 +255,7 @@ issuccess(B::BunchKaufman) = B.info == 0
 
 function Base.show(io::IO, mime::MIME{Symbol("text/plain")}, B::BunchKaufman)
     if issuccess(B)
-        println(io, summary(B))
+        summary(io, B); println(io)
         println(io, "D factor:")
         show(io, mime, B.D)
         println(io, "\n$(B.uplo) factor:")

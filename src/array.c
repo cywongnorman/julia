@@ -53,7 +53,7 @@ size_t jl_arr_xtralloc_limit = 0;
 #define MAXINTVAL (((size_t)-1)>>1)
 
 static jl_array_t *_new_array_(jl_value_t *atype, uint32_t ndims, size_t *dims,
-                               int isunboxed, int elsz)
+                               int isunboxed, int isunion, int elsz)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
     size_t i, tot, nel=1;
@@ -67,7 +67,7 @@ static jl_array_t *_new_array_(jl_value_t *atype, uint32_t ndims, size_t *dims,
             jl_error("invalid Array dimensions");
         nel = prod;
     }
-    int isunion = atype != NULL && jl_is_uniontype(jl_tparam0(atype));
+    assert(atype == NULL || isunion == jl_is_uniontype(jl_tparam0(atype)));
     if (isunboxed) {
         wideint_t prod = (wideint_t)elsz * (wideint_t)nel;
         if (prod > (wideint_t) MAXINTVAL)
@@ -148,19 +148,22 @@ static inline jl_array_t *_new_array(jl_value_t *atype, uint32_t ndims, size_t *
 {
     jl_value_t *eltype = jl_tparam0(atype);
     size_t elsz = 0, al = 0;
+    if (!jl_is_kind(jl_typeof(eltype)))
+        jl_type_error_rt("Array", "element type", (jl_value_t*)jl_type_type, eltype);
     int isunboxed = jl_islayout_inline(eltype, &elsz, &al);
+    int isunion = jl_is_uniontype(eltype);
     if (!isunboxed) {
         elsz = sizeof(void*);
         al = elsz;
     }
 
-    return _new_array_(atype, ndims, dims, isunboxed, elsz);
+    return _new_array_(atype, ndims, dims, isunboxed, isunion, elsz);
 }
 
 jl_array_t *jl_new_array_for_deserialization(jl_value_t *atype, uint32_t ndims, size_t *dims,
-                                             int isunboxed, int elsz)
+                                             int isunboxed, int isunion, int elsz)
 {
-    return _new_array_(atype, ndims, dims, isunboxed, elsz);
+    return _new_array_(atype, ndims, dims, isunboxed, isunion, elsz);
 }
 
 #ifndef JL_NDEBUG
@@ -168,9 +171,10 @@ static inline int is_ntuple_long(jl_value_t *v)
 {
     if (!jl_is_tuple(v))
         return 0;
-    size_t nfields = jl_nfields(v);
-    for (size_t i = 0; i < nfields; i++) {
-        if (jl_field_type(jl_typeof(v), i) != (jl_value_t*)jl_long_type) {
+    jl_value_t *tt = jl_typeof(v);
+    size_t i, nfields = jl_nparams(tt);
+    for (i = 0; i < nfields; i++) {
+        if (jl_tparam(tt, i) != (jl_value_t*)jl_long_type) {
             return 0;
         }
     }
@@ -466,7 +470,10 @@ JL_DLLEXPORT jl_value_t *jl_array_to_string(jl_array_t *a)
 
 JL_DLLEXPORT jl_value_t *jl_pchar_to_string(const char *str, size_t len)
 {
-    jl_value_t *s = jl_gc_alloc(jl_get_ptls_states(), sizeof(size_t)+len+1, jl_string_type);
+    size_t sz = sizeof(size_t) + len + 1; // add space for trailing \nul protector and size
+    if (len == 0)
+        return jl_an_empty_string;
+    jl_value_t *s = jl_gc_alloc_(jl_get_ptls_states(), sz, jl_string_type); // force inlining
     *(size_t*)s = len;
     memcpy((char*)s + sizeof(size_t), str, len);
     ((char*)s + sizeof(size_t))[len] = 0;
@@ -475,7 +482,10 @@ JL_DLLEXPORT jl_value_t *jl_pchar_to_string(const char *str, size_t len)
 
 JL_DLLEXPORT jl_value_t *jl_alloc_string(size_t len)
 {
-    jl_value_t *s = jl_gc_alloc(jl_get_ptls_states(), sizeof(size_t)+len+1, jl_string_type);
+    size_t sz = sizeof(size_t) + len + 1; // add space for trailing \nul protector and size
+    if (len == 0)
+        return jl_an_empty_string;
+    jl_value_t *s = jl_gc_alloc_(jl_get_ptls_states(), sz, jl_string_type); // force inlining
     *(size_t*)s = len;
     ((char*)s + sizeof(size_t))[len] = 0;
     return s;
@@ -547,13 +557,15 @@ JL_DLLEXPORT int jl_array_isassigned(jl_array_t *a, size_t i)
     return 1;
 }
 
-JL_DLLEXPORT void jl_arrayset(jl_array_t *a, jl_value_t *rhs, size_t i)
+JL_DLLEXPORT void jl_arrayset(jl_array_t *a JL_ROOTING_ARGUMENT, jl_value_t *rhs JL_ROOTED_ARGUMENT JL_MAYBE_UNROOTED, size_t i)
 {
     assert(i < jl_array_len(a));
     jl_value_t *eltype = jl_tparam0(jl_typeof(a));
     if (eltype != (jl_value_t*)jl_any_type) {
+        JL_GC_PUSH1(&rhs);
         if (!jl_isa(rhs, eltype))
             jl_type_error("arrayset", eltype, rhs);
+        JL_GC_POP();
     }
     if (!a->flags.ptrarray) {
         if (jl_is_uniontype(eltype)) {
@@ -936,7 +948,7 @@ STATIC_INLINE void jl_array_shrink(jl_array_t *a, size_t dec)
         char *typetagdata;
         char *newtypetagdata;
         if (isbitsunion) {
-            typetagdata = malloc(a->nrows);
+            typetagdata = (char*)malloc(a->nrows);
             memcpy(typetagdata, jl_array_typetagdata(a), a->nrows);
         }
         size_t oldoffsnb = a->offset * elsz;
@@ -1113,8 +1125,10 @@ JL_DLLEXPORT jl_array_t *jl_array_copy(jl_array_t *ary)
 {
     size_t elsz = ary->elsize;
     size_t len = jl_array_len(ary);
+    int isunion = jl_is_uniontype(jl_tparam0(jl_typeof(ary)));
     jl_array_t *new_ary = _new_array_(jl_typeof(ary), jl_array_ndims(ary),
-                                      &ary->nrows, !ary->flags.ptrarray, elsz);
+                                      &ary->nrows, !ary->flags.ptrarray,
+                                      isunion, elsz);
     memcpy(new_ary->data, ary->data, len * elsz);
     // ensure isbits union arrays copy their selector bytes correctly
     if (jl_array_isbitsunion(ary))

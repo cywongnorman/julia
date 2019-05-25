@@ -1,5 +1,8 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
+"""
+Support for sockets. Provides [`IPAddr`](@ref) and subtypes, [`TCPSocket`](@ref), and [`UDPSocket`](@ref).
+"""
 module Sockets
 
 export
@@ -10,6 +13,7 @@ export
     getalladdrinfo,
     getnameinfo,
     getipaddr,
+    getipaddrs,
     getpeername,
     getsockname,
     listen,
@@ -29,7 +33,7 @@ import Base: isless, show, print, parse, bind, convert, isreadable, iswritable, 
 using Base: LibuvStream, LibuvServer, PipeEndpoint, @handle_as, uv_error, associate_julia_struct, uvfinalize,
     notify_error, stream_wait, uv_req_data, uv_req_set_data, preserve_handle, unpreserve_handle, _UVError, IOError,
     eventloop, StatusUninit, StatusInit, StatusConnecting, StatusOpen, StatusClosing, StatusClosed, StatusActive,
-    uv_status_string, check_open, wait_connected,
+    uv_status_string, check_open, wait_connected, OS_HANDLE, RawFD,
     UV_EINVAL, UV_ENOMEM, UV_ENOBUFS, UV_EAGAIN, UV_ECONNABORTED, UV_EADDRINUSE, UV_EACCES, UV_EADDRNOTAVAIL,
     UV_EAI_ADDRFAMILY, UV_EAI_AGAIN, UV_EAI_BADFLAGS,
     UV_EAI_BADHINTS, UV_EAI_CANCELED, UV_EAI_FAIL,
@@ -51,21 +55,20 @@ mutable struct TCPSocket <: LibuvStream
     handle::Ptr{Cvoid}
     status::Int
     buffer::IOBuffer
-    readnotify::Condition
-    connectnotify::Condition
-    closenotify::Condition
+    cond::Base.ThreadSynchronizer
+    closenotify::Base.ThreadSynchronizer
     sendbuf::Union{IOBuffer, Nothing}
     lock::ReentrantLock
     throttle::Int
 
     function TCPSocket(handle::Ptr{Cvoid}, status)
+        lock = Threads.SpinLock()
         tcp = new(
                 handle,
                 status,
                 PipeBuffer(),
-                Condition(),
-                Condition(),
-                Condition(),
+                Base.ThreadSynchronizer(lock),
+                Base.ThreadSynchronizer(lock),
                 nothing,
                 ReentrantLock(),
                 Base.DEFAULT_READ_BUFFER_SZ)
@@ -86,18 +89,31 @@ function TCPSocket(; delay=true)
     return tcp
 end
 
+function TCPSocket(fd::OS_HANDLE)
+    tcp = TCPSocket()
+    err = ccall(:uv_tcp_open, Int32, (Ptr{Cvoid}, OS_HANDLE), pipe.handle, fd)
+    uv_error("tcp_open", err)
+    tcp.status = StatusOpen
+    return tcp
+end
+if OS_HANDLE != RawFD
+    TCPSocket(fd::RawFD) = TCPSocket(Libc._get_osfhandle(fd))
+end
+
+
 mutable struct TCPServer <: LibuvServer
     handle::Ptr{Cvoid}
     status::Int
-    connectnotify::Condition
-    closenotify::Condition
+    cond::Base.ThreadSynchronizer
+    closenotify::Base.ThreadSynchronizer
 
     function TCPServer(handle::Ptr{Cvoid}, status)
+        lock = Threads.SpinLock()
         tcp = new(
             handle,
             status,
-            Condition(),
-            Condition())
+            Base.ThreadSynchronizer(lock),
+            Base.ThreadSynchronizer(lock))
         associate_julia_struct(tcp.handle, tcp)
         finalizer(uvfinalize, tcp)
         return tcp
@@ -141,7 +157,7 @@ mutable struct UDPSocket <: LibuvStream
     status::Int
     recvnotify::Condition
     sendnotify::Condition
-    closenotify::Condition
+    closenotify::Base.ThreadSynchronizer
 
     function UDPSocket(handle::Ptr{Cvoid}, status)
         udp = new(
@@ -149,7 +165,7 @@ mutable struct UDPSocket <: LibuvStream
             status,
             Condition(),
             Condition(),
-            Condition())
+            Base.ThreadSynchronizer())
         associate_julia_struct(udp.handle, udp)
         finalizer(uvfinalize, udp)
         return udp
@@ -167,9 +183,14 @@ end
 show(io::IO, stream::UDPSocket) = print(io, typeof(stream), "(", uv_status_string(stream), ")")
 
 function _uv_hook_close(sock::UDPSocket)
-    sock.handle = C_NULL
-    sock.status = StatusClosed
-    notify(sock.closenotify)
+    lock(sock.closenotify)
+    try
+        sock.handle = C_NULL
+        sock.status = StatusClosed
+        notify(sock.closenotify)
+    finally
+        unlock(sock.closenotify)
+    end
     notify(sock.sendnotify)
     notify_error(sock.recvnotify,EOFError())
 end
@@ -371,15 +392,20 @@ end
 function uv_connectcb(conn::Ptr{Cvoid}, status::Cint)
     hand = ccall(:jl_uv_connect_handle, Ptr{Cvoid}, (Ptr{Cvoid},), conn)
     sock = @handle_as hand LibuvStream
-    if status >= 0
-        if !(sock.status == StatusClosed || sock.status == StatusClosing)
-            sock.status = StatusOpen
+    lock(sock.cond)
+    try
+        if status >= 0
+            if !(sock.status == StatusClosed || sock.status == StatusClosing)
+                sock.status = StatusOpen
+            end
+            notify(sock.cond)
+        else
+            ccall(:jl_forceclose_uv, Cvoid, (Ptr{Cvoid},), hand)
+            err = _UVError("connect", status)
+            notify_error(sock.cond, err)
         end
-        notify(sock.connectnotify)
-    else
-        ccall(:jl_forceclose_uv, Cvoid, (Ptr{Cvoid},), hand)
-        err = _UVError("connect", status)
-        notify_error(sock.connectnotify, err)
+    finally
+        unlock(sock.cond)
     end
     Libc.free(conn)
     nothing
@@ -471,16 +497,21 @@ listen(host::IPAddr, port::Integer; backlog::Integer=BACKLOG_DEFAULT) = listen(I
 function listen(callback, server::Union{TCPSocket, UDPSocket})
     @async begin
         local client = TCPSocket()
-        while isopen(server)
-            err = accept_nonblock(server, client)
-            if err == 0
-                callback(client)
-                client = TCPSocket()
-            elseif err != UV_EAGAIN
-                uv_error("accept", err)
-            else
-                stream_wait(server, server.connectnotify)
+        lock(server.cond)
+        try
+            while isopen(server)
+                err = accept_nonblock(server, client)
+                if err == 0
+                    callback(client)
+                    client = TCPSocket()
+                elseif err != UV_EAGAIN
+                    uv_error("accept", err)
+                else
+                    stream_wait(server, server.cond)
+                end
             end
+        finally
+            unlock(server.cond)
         end
     end
     return sock
@@ -494,10 +525,15 @@ end
 # from `listen`
 function uv_connectioncb(stream::Ptr{Cvoid}, status::Cint)
     sock = @handle_as stream LibuvServer
-    if status >= 0
-        notify(sock.connectnotify)
-    else
-        notify_error(sock.connectnotify, _UVError("connection", status))
+    lock(sock.cond)
+    try
+        if status >= 0
+            notify(sock.cond)
+        else
+            notify_error(sock.cond, _UVError("connection", status))
+        end
+    finally
+        unlock(sock.cond)
     end
     nothing
 end
@@ -540,7 +576,12 @@ function accept(server::LibuvServer, client::LibuvStream)
         elseif err != UV_EAGAIN
             uv_error("accept", err)
         end
-        stream_wait(server, server.connectnotify)
+        lock(server.cond)
+        try
+            stream_wait(server, server.cond)
+        finally
+            unlock(server.cond)
+        end
     end
     uv_error("accept", UV_ECONNABORTED)
 end

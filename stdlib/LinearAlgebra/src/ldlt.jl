@@ -4,7 +4,7 @@ struct LDLt{T,S<:AbstractMatrix{T}} <: Factorization{T}
     data::S
 
     function LDLt{T,S}(data) where {T,S<:AbstractMatrix{T}}
-        @assert !has_offset_axes(data)
+        require_one_based_indexing(data)
         new{T,S}(data)
     end
 end
@@ -48,13 +48,13 @@ julia> S
   ⋅        0.545455  3.90909
 ```
 """
-function ldlt!(S::SymTridiagonal{T,V}) where {T<:Real,V}
+function ldlt!(S::SymTridiagonal{T,V}) where {T,V}
     n = size(S,1)
     d = S.dv
     e = S.ev
     @inbounds @simd for i = 1:n-1
         e[i] /= d[i]
-        d[i+1] -= abs2(e[i])*d[i]
+        d[i+1] -= e[i]^2*d[i]
     end
     return LDLt{T,SymTridiagonal{T,V}}(S)
 end
@@ -91,15 +91,19 @@ julia> S \\ b
  1.3488372093023255
 ```
 """
-function ldlt(M::SymTridiagonal{T}) where T
-    S = typeof(zero(T)/one(T))
-    return S == T ? ldlt!(copy(M)) : ldlt!(SymTridiagonal{S}(M))
+function ldlt(M::SymTridiagonal{T}; shift::Number=false) where T
+    S = typeof((zero(T)+shift)/one(T))
+    Mₛ = SymTridiagonal{S}(copy_oftype(M.dv, S), copy_oftype(M.ev, S))
+    if !iszero(shift)
+        Mₛ.dv .+= shift
+    end
+    return ldlt!(Mₛ)
 end
 
 factorize(S::SymTridiagonal) = ldlt(S)
 
-function ldiv!(S::LDLt{T,M}, B::AbstractVecOrMat{T}) where {T,M<:SymTridiagonal{T}}
-    @assert !has_offset_axes(B)
+function ldiv!(S::LDLt{<:Any,<:SymTridiagonal}, B::AbstractVecOrMat)
+    require_one_based_indexing(B)
     n, nrhs = size(B, 1), size(B, 2)
     if size(S,1) != n
         throw(DimensionMismatch("Matrix has dimensions $(size(S)) but right hand side has first dimension $n"))
@@ -128,6 +132,9 @@ function ldiv!(S::LDLt{T,M}, B::AbstractVecOrMat{T}) where {T,M<:SymTridiagonal{
     end
     return B
 end
+
+rdiv!(B::AbstractVecOrMat, S::LDLt{<:Any,<:SymTridiagonal}) =
+    transpose(ldiv!(S, transpose(B)))
 
 function logabsdet(F::LDLt{<:Any,<:SymTridiagonal})
     it = (F.data[i,i] for i in 1:size(F, 1))

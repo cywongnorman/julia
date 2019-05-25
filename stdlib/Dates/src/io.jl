@@ -34,7 +34,7 @@ All subtypes of `AbstractDateToken` must define this method in order
 to be able to print a Date / DateTime object according to a `DateFormat`
 containing that token.
 """
-function format end
+format(io::IO, tok::AbstractDateToken, dt::TimeType, locale)
 
 # fallback to tryparsenext/format methods that don't care about locale
 @inline function tryparsenext(d::AbstractDateToken, str, i, len, locale)
@@ -51,7 +51,31 @@ function Base.string(t::Time)
     return "$hh:$mii:$ss$ns"
 end
 
-Base.show(io::IO, x::Time) = print(io, string(x))
+Base.show(io::IO, ::MIME"text/plain", t::Time) = print(io, t)
+Base.print(io::IO, t::Time) = print(io, string(t))
+
+function Base.show(io::IO, t::Time)
+    if get(io, :compact, false)
+        print(io, t)
+    else
+        values = [
+            hour(t)
+            minute(t)
+            second(t)
+            millisecond(t)
+            microsecond(t)
+            nanosecond(t)
+        ]
+        index = something(findlast(!iszero, values), 1)
+
+        print(io, Time, "(")
+        for i in 1:index
+            show(io, values[i])
+            i != index && print(io, ", ")
+        end
+        print(io, ")")
+    end
+end
 
 @inline function format(io, d::AbstractDateToken, dt, locale)
     format(io, d, dt)
@@ -529,7 +553,49 @@ end
 
 # show
 
+function Base.show(io::IO, p::P) where P <: Period
+    if get(io, :compact, false)
+        print(io, p)
+    else
+        print(io, P, '(', p.value, ')')
+    end
+end
+
 function Base.show(io::IO, dt::DateTime)
+    if get(io, :compact, false)
+        print(io, dt)
+    else
+        y,m,d = yearmonthday(dt)
+        h = hour(dt)
+        mi = minute(dt)
+        s = second(dt)
+        ms = millisecond(dt)
+        if ms == 0
+            print(io, DateTime, "($y, $m, $d, $h, $mi, $s)")
+        else
+            print(io, DateTime, "($y, $m, $d, $h, $mi, $s, $ms)")
+        end
+    end
+end
+
+function Base.show(io::IO, ::MIME"text/plain", dt::DateTime)
+    print(io, dt)
+end
+
+function Base.show(io::IO, ::MIME"text/plain", dt::Date)
+    print(io, dt)
+end
+
+function Base.show(io::IO, dt::Date)
+    if get(io, :compact, false)
+        print(io, dt)
+    else
+        y,m,d = yearmonthday(dt)
+        print(io, Date, "($y, $m, $d)")
+    end
+end
+
+function Base.print(io::IO, dt::DateTime)
     if millisecond(dt) == 0
         format(io, dt, dateformat"YYYY-mm-dd\THH:MM:SS")
     else
@@ -537,7 +603,7 @@ function Base.show(io::IO, dt::DateTime)
     end
 end
 
-function Base.show(io::IO, dt::Date)
+function Base.print(io::IO, dt::Date)
     format(io, dt, dateformat"YYYY-mm-dd")
 end
 
